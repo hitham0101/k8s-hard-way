@@ -1,0 +1,11 @@
+.DS_Store
+.terraform.*
+.terraform/*
+terraform.*
+.envrc
+*.env.secret
+sandbox-terrafrom.access-key.json
+.idea
+*.access-key.json
+.terraform
+.terraform.lock.hcl

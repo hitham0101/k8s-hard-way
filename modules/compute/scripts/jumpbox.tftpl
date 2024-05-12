@@ -1,0 +1,353 @@
+#! /bin/bash
+
+sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin prohibit-password yes/g' /etc/ssh/sshd_config
+echo "${key_pub} hub-key" > /root/.ssh/authorized_keys
+swapoff -a
+
+###################################################
+echo "${key_priv}" > /root/.ssh/key
+echo "${key_pub}" > /root/.ssh/key.pub
+chmod 400 /root/.ssh/key
+chmod 400 /root/.ssh/key.pub
+eval $(ssh-agent)
+ssh-add ~/.ssh/key
+
+###################################################
+
+apt-get -y install wget curl vim openssl git
+cd ~
+git clone --depth 1   https://github.com/kelseyhightower/kubernetes-the-hard-way.git
+cd kubernetes-the-hard-way
+mkdir downloads
+
+sed -i 's/arm/amd/g' downloads.txt
+sed -i 's/linux-arm\.tar\.gz/linux-amd64\.tar\.gz/g' downloads.txt
+
+wget -q --show-progress --https-only --timestamping -P downloads -i downloads.txt
+chmod +x downloads/kubectl
+cp downloads/kubectl /usr/local/bin/
+
+###################################################
+
+
+cat <<EOF > machines.txt
+${master_private_ip} server.kubernetes.local server
+${worker0_private_ip} node-0.kubernetes.local node-0 10.200.0.0/24
+${worker1_private_ip} node-1.kubernetes.local node-1 10.200.1.0/24
+EOF
+
+###############################################
+
+while read IP FQDN HOST SUBNET; do 
+    CMD="sed -i 's/^127.0.0.1.*/127.0.0.1\t$FQDN $HOST/' /etc/hosts"
+    ssh -o StrictHostKeyChecking=no -n root@$IP "$CMD"
+    ssh -o StrictHostKeyChecking=no -n root@$IP hostnamectl hostname $HOST
+done < machines.txt
+
+###############################################
+
+cat <<EOF > hosts
+
+# Kubernetes The Hard Way
+
+EOF
+
+while read IP FQDN HOST SUBNET; do 
+    ENTRY="$IP $FQDN $HOST"
+    echo $ENTRY >> hosts
+done < machines.txt
+
+# Append the hosts file to the /etc/hosts file in the jump box server
+cat hosts >> /etc/hosts
+
+# Copy the hosts file to all the machines master and workers
+while read IP FQDN HOST SUBNET; do
+  scp -q -o StrictHostKeyChecking=no hosts root@$HOST:~/
+  ssh -n -o StrictHostKeyChecking=no root@$HOST "cat hosts >> /etc/hosts"
+done < machines.txt
+
+##################################################
+
+openssl genrsa -out ca.key 4096
+openssl req -x509 -new -sha512 -noenc \
+  -key ca.key -days 3653 \
+  -config ca.conf \
+  -out ca.crt
+
+certs=(
+  "admin" "node-0" "node-1"
+  "kube-proxy" "kube-scheduler"
+  "kube-controller-manager"
+  "kube-api-server"
+  "service-accounts"
+)
+
+##################################################
+# generate-certs
+echo "Zm9yIGkgaW4gJHtjZXJ0c1sqXX07IGRvCiAgb3BlbnNzbCBnZW5yc2EgLW91dCAiJHtpfS5rZXkiIDQwOTYKCiAgb3BlbnNzbCByZXEgLW5ldyAta2V5ICIke2l9LmtleSIgLXNoYTI1NiBcCiAgICAtY29uZmlnICJjYS5jb25mIiAtc2VjdGlvbiAke2l9IFwKICAgIC1vdXQgIiR7aX0uY3NyIgogIAogIG9wZW5zc2wgeDUwOSAtcmVxIC1kYXlzIDM2NTMgLWluICIke2l9LmNzciIgXAogICAgLWNvcHlfZXh0ZW5zaW9ucyBjb3B5YWxsIFwKICAgIC1zaGEyNTYgLUNBICJjYS5jcnQiIFwKICAgIC1DQWtleSAiY2Eua2V5IiBcCiAgICAtQ0FjcmVhdGVzZXJpYWwgXAogICAgLW91dCAiJHtpfS5jcnQiCmRvbmU=" | base64 -d > generate-certs.sh && chmod +x generate-certs.sh && source ./generate-certs.sh
+
+##################################################
+
+
+for host in node-0 node-1; do
+  ssh -o StrictHostKeyChecking=no root@$host mkdir /var/lib/kubelet/
+  
+  scp -q -o StrictHostKeyChecking=no ca.crt root@$host:/var/lib/kubelet/
+    
+  scp -q -o StrictHostKeyChecking=no $host.crt root@$host:/var/lib/kubelet/kubelet.crt
+    
+  scp -q -o StrictHostKeyChecking=no $host.key root@$host:/var/lib/kubelet/kubelet.key
+done
+
+
+scp -q -o StrictHostKeyChecking=no ca.key ca.crt kube-api-server.key kube-api-server.crt service-accounts.key service-accounts.crt root@server:~/
+
+
+export ENCRYPTION_KEY=$(head -c 32 /dev/urandom | base64)
+
+cat <<EOF > encryption-config.yaml
+
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+  - resources:
+      - secrets
+      - configmaps
+      - pandas.awesome.bears.example
+    providers:
+      - aescbc:
+          keys:
+            - name: key1
+              # See the following text for more details about the secret value
+              secret: $ENCRYPTION_KEY
+      - identity: {} # this fallback allows reading unencrypted secrets;
+                     # for example, during initial migration
+
+EOF
+
+scp -q -o StrictHostKeyChecking=no encryption-config.yaml root@server:~/
+
+
+scp -q -o StrictHostKeyChecking=no \
+  downloads/etcd-v3.4.27-linux-amd64.tar.gz \
+  units/etcd.service \
+  root@server:~/
+
+
+#######################################
+
+scp -q -o StrictHostKeyChecking=no \
+  downloads/kube-apiserver \
+  downloads/kube-controller-manager \
+  downloads/kube-scheduler \
+  downloads/kubectl \
+  units/kube-apiserver.service \
+  units/kube-controller-manager.service \
+  units/kube-scheduler.service \
+  configs/kube-scheduler.yaml \
+  configs/kube-apiserver-to-kubelet.yaml \
+  root@server:~/
+
+###################################################
+
+for host in node-0 node-1; do
+  kubectl config set-cluster kubernetes-the-hard-way \
+    --certificate-authority=ca.crt \
+    --embed-certs=true \
+    --server=https://server.kubernetes.local:6443 \
+    --kubeconfig=$host.kubeconfig
+
+  kubectl config set-credentials system:node:$host \
+    --client-certificate=$host.crt \
+    --client-key=$host.key \
+    --embed-certs=true \
+    --kubeconfig=$host.kubeconfig
+
+  kubectl config set-context default \
+    --cluster=kubernetes-the-hard-way \
+    --user=system:node:$host \
+    --kubeconfig=$host.kubeconfig
+
+  kubectl config use-context default \
+    --kubeconfig=$host.kubeconfig
+done
+
+
+
+###################################################
+
+kubectl config set-cluster kubernetes-the-hard-way \
+  --certificate-authority=ca.crt \
+  --embed-certs=true \
+  --server=https://server.kubernetes.local:6443 \
+  --kubeconfig=kube-proxy.kubeconfig
+
+kubectl config set-credentials system:kube-proxy \
+  --client-certificate=kube-proxy.crt \
+  --client-key=kube-proxy.key \
+  --embed-certs=true \
+  --kubeconfig=kube-proxy.kubeconfig
+
+kubectl config set-context default \
+  --cluster=kubernetes-the-hard-way \
+  --user=system:kube-proxy \
+  --kubeconfig=kube-proxy.kubeconfig
+
+kubectl config use-context default \
+  --kubeconfig=kube-proxy.kubeconfig
+
+kubectl config set-cluster kubernetes-the-hard-way \
+  --certificate-authority=ca.crt \
+  --embed-certs=true \
+  --server=https://server.kubernetes.local:6443 \
+  --kubeconfig=kube-controller-manager.kubeconfig
+
+kubectl config set-credentials system:kube-controller-manager \
+  --client-certificate=kube-controller-manager.crt \
+  --client-key=kube-controller-manager.key \
+  --embed-certs=true \
+  --kubeconfig=kube-controller-manager.kubeconfig
+
+kubectl config set-context default \
+  --cluster=kubernetes-the-hard-way \
+  --user=system:kube-controller-manager \
+  --kubeconfig=kube-controller-manager.kubeconfig
+
+kubectl config use-context default \
+  -kubeconfig=kube-controller-manager.kubeconfig
+
+kubectl config set-cluster kubernetes-the-hard-way \
+  --certificate-authority=ca.crt \
+  --embed-certs=true \
+  --server=https://server.kubernetes.local:6443 \
+  --kubeconfig=kube-scheduler.kubeconfig
+
+kubectl config set-credentials system:kube-scheduler \
+  --client-certificate=kube-scheduler.crt \
+  --client-key=kube-scheduler.key \
+  --embed-certs=true \
+  --kubeconfig=kube-scheduler.kubeconfig
+
+kubectl config set-context default \
+  --cluster=kubernetes-the-hard-way \
+  --user=system:kube-scheduler \
+  --kubeconfig=kube-scheduler.kubeconfig
+
+kubectl config use-context default \
+    --kubeconfig=kube-scheduler.kubeconfig
+
+
+kubectl config set-cluster kubernetes-the-hard-way \
+  --certificate-authority=ca.crt \
+  --embed-certs=true \
+  --server=https://127.0.0.1:6443 \
+  --kubeconfig=admin.kubeconfig
+
+kubectl config set-credentials admin \
+  --client-certificate=admin.crt \
+  --client-key=admin.key \
+  --embed-certs=true \
+  --kubeconfig=admin.kubeconfig
+
+kubectl config set-context default \
+  --cluster=kubernetes-the-hard-way \
+  --user=admin \
+  --kubeconfig=admin.kubeconfig
+
+kubectl config use-context default \
+  --kubeconfig=admin.kubeconfig
+
+#####################################################
+
+for host in node-0 node-1; do
+  
+  scp -q -o StrictHostKeyChecking=no kube-proxy.kubeconfig \
+    root@$host:/var/lib/kube-proxy/kubeconfig \
+  
+  scp -q -o StrictHostKeyChecking=no $host.kubeconfig \
+    root@$host:/var/lib/kubelet/kubeconfig
+done
+
+scp -q -o StrictHostKeyChecking=no admin.kubeconfig \
+  kube-controller-manager.kubeconfig \
+  kube-scheduler.kubeconfig \
+  root@server:~/
+
+#######################################
+
+# Move the binaries and configuration files to the respective machines
+for host in node-0 node-1; do
+  scp -q -o StrictHostKeyChecking=no \
+    downloads/runc.amd64 \
+    downloads/crictl-v1.28.0-linux-amd64.tar.gz \
+    downloads/cni-plugins-linux-amd64-v1.3.0.tgz \
+    downloads/containerd-1.7.8-linux-amd64.tar.gz \
+    downloads/kubectl \
+    downloads/kubelet \
+    downloads/kube-proxy \
+    configs/99-loopback.conf \
+    configs/containerd-config.toml \
+    configs/kubelet-config.yaml \
+    configs/kube-proxy-config.yaml \
+    units/containerd.service \
+    units/kubelet.service \
+    units/kube-proxy.service \
+    root@$host:~/
+done
+
+for host in node-0 node-1; do
+  SUBNET=$(grep $host machines.txt | cut -d " " -f 4)
+  sed "s|SUBNET|$SUBNET|g" \
+    configs/10-bridge.conf > 10-bridge.conf 
+    
+  sed "s|SUBNET|$SUBNET|g" \
+    configs/kubelet-config.yaml > kubelet-config.yaml
+    
+  scp -q -o StrictHostKeyChecking=no 10-bridge.conf kubelet-config.yaml \
+  root@$host:~/
+done
+
+
+#######################################
+
+SERVER_IP=$(grep server machines.txt | cut -d " " -f 1)
+NODE_0_IP=$(grep node-0 machines.txt | cut -d " " -f 1)
+NODE_0_SUBNET=$(grep node-0 machines.txt | cut -d " " -f 4)
+NODE_1_IP=$(grep node-1 machines.txt | cut -d " " -f 1)
+NODE_1_SUBNET=$(grep node-1 machines.txt | cut -d " " -f 4)
+ssh -o StrictHostKeyChecking=no root@server <<EOF
+  ip route add $NODE_0_SUBNET via $NODE_0_IP
+EOF
+ssh -o StrictHostKeyChecking=no root@node-0 <<EOF
+  ip route add $NODE_1_SUBNET via $NODE_1_IP
+EOF
+ssh -o StrictHostKeyChecking=no root@node-1 <<EOF
+  ip route add $NODE_0_SUBNET via $NODE_0_IP
+EOF
+
+###############################################################################
+
+kubectl config set-cluster kubernetes-the-hard-way \
+  --certificate-authority=ca.crt \
+  --embed-certs=true \
+  --server=https://server.kubernetes.local:6443
+
+kubectl config set-credentials admin \
+  --client-certificate=admin.crt \
+  --client-key=admin.key
+
+kubectl config set-context kubernetes-the-hard-way \
+  --cluster=kubernetes-the-hard-way \
+  --user=admin
+
+kubectl config use-context kubernetes-the-hard-way
+
+
+####################################################################################################
+
+for host in node-0 node-1 server; do
+ssh -o StrictHostKeyChecking=no root@$host <<EOF
+  /root/install.sh
+EOF
+done
+
